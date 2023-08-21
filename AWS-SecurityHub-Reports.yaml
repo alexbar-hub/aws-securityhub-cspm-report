@@ -321,7 +321,7 @@ Resources:
         - IAMLambdaRole
         - Arn
       Runtime: "python3.9"
-      Timeout: 60
+      Timeout: 600
 
   SecurityHubReportsRule:
     Type: 'AWS::Events::Rule'
