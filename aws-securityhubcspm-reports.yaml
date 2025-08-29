@@ -1,38 +1,61 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Creates a lambda that generates an AWS SecurityHub repot once a week and sends an email with a link to download it. The link expires after 12 hours."
+Description: "Creates a Lambda that generates an AWS SecurityHub report on a schedule and sends a message to a custom Slack channel with a link to a page in Confluence. The output is saved in an S3 bucket."
 
 Parameters:
   
   SecurityHubS3Bucket:
     Type: String
-    Default: "Your Bucket name"
+    Description: "Name of the bucket that will host the reports."
+    Default: securityhub-reports-bucket
+
+  CloudFrontDistributionArn:
+    Type: String
+    Description: "ARN of the CloudFront distribution allowed to access the S3 bucket."
+    Default: "arn:aws:cloudfront::1234567890:distribution/distributionid"
+
+  ConfluencePageUrl:
+    Type: String
+    Description: "Url of the Confluence page that will show the data via CloudFront."
+    Default: "https://mydomain.atlassian.net/something/something/SecurityHubCSPM+Reporting"
 
   SecurityHubLambda:
     Type: String
-    Default: "Your Lambda name."
+    Description: "Name of the lambda that will create the reports."
+    Default: securityhub-reports-lambda
 
   SecurityHubSNSTopic:
     Type: String
-    Default: "Your SNS topic name."
+    Description: "Name of the SNS topic to send notifications."
+    Default: securityhub-reports-topic
 
   SecurityHubSNSSubscription1:
     Type: String
-    Default: "Your first email here."
+    Description: "Email of the first recipient of the reports notification."
+    Default: recipient1@securityhub.reports
 
   SecurityHubSNSSubscription2:
     Type: String
-    Default: "Your second email here."
+    Description: "Email of the second recipient of the reports notification."
+    Default: recipient2@securityhub.reports
+
+  SecurityHubSNSSubscription3:
+    Type: String
+    Description: "Https endpoint of the recipient of the reports notification."
+    Default: https://hooks.slack.com/securityhub.reports
 
   SecurityHubEventBridge:
     Type: String
-    Default: "Your EventBridge rule here."
+    Description: "Name of the EventBridge rule that triggers the lambda function."
+    Default: securityhub-reports-rule
 
   SecurityHubIAMRole:
     Type: String
-    Default: "IAM Role used by your Lambda here."
+    Description: "Name of the IAM role used by the lambda function."
+    Default: securityhub-reports-role
 
   SecurityHubCloudWatchGroup:
     Type: String
+    Description: "Prefix of the CloudWatch Log Group used by the Lambda Function."
     Default: /aws/lambda
 
 Resources:
@@ -73,6 +96,24 @@ Resources:
             NoncurrentVersionExpiration: 
               NoncurrentDays: 1
 
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "AllowCloudFrontServicePrincipal"
+            Effect: Allow
+            Principal:
+              Service: "cloudfront.amazonaws.com"
+            Action:
+              - 's3:GetObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceArn': !Ref CloudFrontDistributionArn
   
   SnsTopic:
     Type: "AWS::SNS::Topic"
@@ -82,7 +123,21 @@ Resources:
           Protocol: "email"
         - Endpoint: !Ref SecurityHubSNSSubscription2
           Protocol: "email"
+        - Endpoint: !Ref SecurityHubSNSSubscription3
+          Protocol: "https" 
       TopicName: !Ref SecurityHubSNSTopic
+
+  MyReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Join:
+          - ""
+          - 
+            - !Ref SecurityHubCloudWatchGroupPrefix
+            - "/"
+            - !Ref SecurityHubLambda
+      RetentionInDays: 90
 
   IAMLambdaRole:
     Type: 'AWS::IAM::Role'
@@ -112,7 +167,7 @@ Resources:
               - "logs:CreateLogStream"
               - "logs:PutLogEvents"
             Resource:
-              - !Sub 'arn:aws:logs:*:*:log-group:${SecurityHubCloudWatchGroup}/${SecurityHubLambda}:*'
+              - !Sub 'arn:aws:logs:*:*:log-group:${SecurityHubCloudWatchGroupPrefix}/${SecurityHubLambda}:*'
       - PolicyName: SecurityHub-Reports-SNS-Publish
         PolicyDocument:
           Version: "2012-10-17"
@@ -152,6 +207,13 @@ Resources:
               - "s3:ListJobs"
               - "s3:ListMultiRegionAccessPoints"
             Resource: "*"
+      - PolicyName: SecurityHub-Reports-Org-Access
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "organizations:DescribeAccount"
+            Resource: "*"
 
   LambdaSecurityHubReports:
     Type: 'AWS::Lambda::Function'
@@ -161,7 +223,7 @@ Resources:
       Code:
         ZipFile:
           !Sub |
-          # Source: https://github.com/ykbryan/lambda-get-securityhub-findings
+          # Source of the initial work here: https://github.com/ykbryan/lambda-get-securityhub-findings
 
           import json
           import boto3
@@ -172,6 +234,8 @@ Resources:
           sns = boto3.client('sns')
           securityhub = boto3.client('securityhub')
           s3 = boto3.resource('s3')
+          org_client = boto3.client('organizations')  # AWS Organizations client to get account details
+
           _filter = Filters={
               'ProductName': [
                   {
@@ -197,12 +261,12 @@ Resources:
                       'Comparison': 'NOT_EQUALS'
                   }
               ],
-              'GeneratorId': [
-                  {
-                      'Value': 'aws-foundation',
-                      'Comparison': 'PREFIX'
-                  }
-              ],
+            #  'GeneratorId': [
+            #      {
+            #          'Value': 'aws-foundation',
+            #          'Comparison': 'PREFIX'
+            #      }
+            #  ],
           }
           _sort = SortCriteria=[
               {
@@ -214,7 +278,25 @@ Resources:
                   'SortOrder': 'desc'
               }
           ]
+
           MAX_ITEMS=100
+
+          # Cache for account names to avoid redundant API calls
+          account_name_cache = {}
+
+          def get_account_name(account_id):
+              # Check cache first
+              if account_id in account_name_cache:
+                  return account_name_cache[account_id]
+              
+              try:
+                  response = org_client.describe_account(AccountId=account_id)
+                  account_name = response['Account']['Name']
+                  account_name_cache[account_id] = account_name  # Cache the account name
+                  return account_name
+              except Exception as e:
+                  print(f"Error fetching account name for {account_id}: {e}")
+                  return account_id
 
           def lambda_handler(event, context):
               # cannot seems to pass token = None into the get_findings() 
@@ -223,59 +305,107 @@ Resources:
                 SortCriteria=_sort,
                 MaxResults=MAX_ITEMS
               )
+
               from datetime import datetime
               current_datetime = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+              current_date = datetime.now().strftime('%d-%m-%Y')
+              current_time = datetime.now().strftime('%H:%M:%S')
               print("Current date & time : ", current_datetime)
-              BUCKET_NAME=os.environ ['BucketName'] 
-              KEY=current_datetime+"-SecurityHub_Findings.csv"
+              print("Current date : ", current_date)
+              print("Current time : ", current_time)
+              BUCKET_NAME=os.environ ['BucketName']
+              timestamped_key = current_datetime + "-SecurityHub_Findings.csv"
+              latest_key = "SecurityHub_Findings_Latest.csv"
+              date_time_key = "SecurityHub_Findings_Latest_Date_Time.csv"
               
-              with open("/tmp/data.csv", "w") as file:
+              all_findings = []
+              
+              # Generate the first file that contains all data
+              with open("/tmp/securityhubreport.csv", "w", newline='', encoding='utf-8') as file:
                   csv_file = csv.writer(file)
                   
                   keys = []
                   count = 0
-                  while(result != None): 
-                      
-                      items = []
+                  while result:
                       findings = result['Findings']
-                      
+                      current_batch = []
                       for finding in findings: 
+                          # print("Finding Structure:", json.dumps(finding, indent=2))  # Print raw finding
                           count += 1
+                          account_id = finding['AwsAccountId']
+                          account_name = get_account_name(account_id)
                           item = {}
-                          item['Standard'] = finding['GeneratorId']
+                          item['AccountId'] = account_id
+                          item['AccountName'] = account_name
                           item['Status'] = finding['Compliance']['Status']
                           item['Severity'] = finding['Severity']['Label']
-                          item['Id'] = finding['ProductFields']['ControlId']
+                          item['WorkflowStatus'] = finding['Workflow']['Status']
+                          #item['Id'] = finding['ProductFields']['ControlId']
                           item['Title'] = finding['Title']
-                          item['Account'] = finding['AwsAccountId']
-                          item['ResourceType'] = finding['Resources'][0]['Type']
-                          item['Remediation'] = finding['Remediation']['Recommendation']['Url']
-                          item['ResourceId'] = finding['Resources'][0]['Id']
                           item['Description'] = finding['Description']
-                          item['FirstObserved'] = finding['FirstObservedAt']
-                          item['LastObserved'] = finding['LastObservedAt']
-                          item['Created'] = finding['CreatedAt']
-                          item['Updated'] = finding['UpdatedAt']
+                          item['ResourceType'] = finding['Resources'][0]['Type']
+                          item['ResourceId'] = finding['Resources'][0]['Id']
+                          item['Remediation'] = finding['Remediation']['Recommendation']['Url']
+                          item['Standard'] = finding['GeneratorId']
+                          item['FirstObserved'] = finding.get('FirstObservedAt', 'N/A')
+                          item['LastObserved'] = finding.get('LastObservedAt', 'N/A')
+                          item['Created'] = finding.get('CreatedAt', 'N/A')
+                          item['Updated'] = finding.get('UpdatedAt', 'N/A')
                           #item['json'] = finding
-                          items.append(item)
-                          if (len(keys) == 0):
+                          # print("Item to be added:", json.dumps(item, indent=2))  # Print the item
+                          current_batch.append(item)
+                          if not keys:
                               keys = list(item.keys())
                               csv_file.writerow(keys)
-                      
-                      for d in items:
+
+                      for d in current_batch:
                           csv_file.writerow(list(d.values()))
-                      
-                      if "NextToken" in list(result.keys()):
+
+                          all_findings.extend(current_batch)
+                          # print("All Findings so far:", json.dumps(all_findings, indent=2))  # Print current state of all_findings
+                      if "NextToken" in result:
                           token = result['NextToken']
                           result = securityhub.get_findings(Filters=_filter, SortCriteria=_sort, MaxResults=MAX_ITEMS, NextToken=token)
                       else:
-                              result = None
+                          result = None
               
-              csv_binary = open('/tmp/data.csv', 'rb').read()
+              csv_binary = open('/tmp/securityhubreport.csv', 'rb').read()
               
               try:
-                  obj = s3.Object(BUCKET_NAME, KEY)
-                  obj.put(Body=csv_binary)
+                  obj = s3.Object(BUCKET_NAME, timestamped_key)
+                  obj.put(Body=csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+              ### Debug
+              #print("All Findings:", json.dumps(all_findings, indent=2))
+
+              # Upload the second file with fixed name for Confluence
+              try:
+                  obj_latest = s3.Object(BUCKET_NAME, latest_key)
+                  obj_latest.put(Body=csv_binary, ContentType='text/csv')
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] == "404":
+                      print("The object does not exist.")
+                  else:
+                      raise
+
+              ### Generate the third file to get date/time execution in Confluence
+              with open("/tmp/date-time.csv", "w", newline='', encoding='utf-8') as date_file:
+                  csv_datetime = csv.writer(date_file)
+                  
+                  # Write a single line with the current execution date and time
+                  csv_datetime.writerow(["Latest UTC Execution Date", "Latest UTC Execution Time"])
+                  csv_datetime.writerow([current_date, current_time])
+
+              date_csv_binary = open('/tmp/date-time.csv', 'rb').read()
+              
+              # Upload the date-time CSV file
+              try:
+                  obj_datetime = s3.Object(BUCKET_NAME, date_time_key)
+                  obj_datetime.put(Body=date_csv_binary, ContentType='text/csv')
               except botocore.exceptions.ClientError as e:
                   if e.response['Error']['Code'] == "404":
                       print("The object does not exist.")
@@ -287,14 +417,22 @@ Resources:
                       'get_object',
                       Params={
                           'Bucket': BUCKET_NAME,
-                          'Key': KEY
-                          },
+                          'Key': timestamped_key
+                      },
                       ExpiresIn=43200
                   )
-                  print('Download URL:' , download_url)
-                  message = "A new SecurityHub report is available, click on the following link to download: %s \n This URL expires in 12 hours." % (download_url)
+                  print('Download URL:', download_url)
+                  confluence_page_url = os.environ ['SecurityHubCSPMConfluencePageUrl'] 
+
+                  message = (
+                      f"A new SecurityHub report is available.\n\n"
+                      f"Click on the following link to view it in Confluence and to download it: {confluence_page_url}.\n\n"
+                      #f"Click on the following link to download it: {download_url}.\n\n"
+                      #f"The download URL expires in 12 hours."
+                  )
                   response = sns.publish(
                       TopicArn = os.environ ['SnsTopicArn'] ,
+                      Subject = "New weekly SecurityHub report.",
                       Message = message
                       )
                   return {
@@ -302,25 +440,24 @@ Resources:
                       "total": count
                   }
               except Exception as e:
-                  raise utils_exception.ErrorResponse(400, e, Log)
+                  raise Exception.ErrorResponse(400, e, Log)
               
               return {
                   'message': 'Error found, please check your logs',
                   'total': 0
               }
-                # Environment:
-                  # Variables:
       Handler: "index.lambda_handler"
       Environment:
        Variables:
           SnsTopicArn: !Ref SnsTopic
           BucketName: !Ref S3Bucket
+          SecurityHubCSPMConfluencePageUrl: !Ref ConfluencePageUrl
       MemorySize: 512
       Role: 
         Fn::GetAtt:
         - IAMLambdaRole
         - Arn
-      Runtime: "python3.9"
+      Runtime: "python3.13"
       Timeout: 600
 
   SecurityHubReportsRule:
