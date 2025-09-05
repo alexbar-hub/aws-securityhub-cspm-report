@@ -6,6 +6,7 @@ Automatically publish SecurityHub CSPM findings for collaboration in a human-rea
   - [Table of contents](#table-of-contents)
   - [Intro](#intro)
   - [What it does](#what-it-does)
+  - [Design](#design)
     - [Automated](#automated)
     - [Manual](#manual)
   - [Deployment](#deployment)
@@ -19,6 +20,20 @@ This repo aims to automatically publish SecurityHub CSPM findings and make them 
 
 ## What it does
 This CloudFormation template automates the creation of an end-to-end SecurityHub CSPM reporting pipeline.
+
+## Design
+Assumptions:
+* The design assumes that: 
+  * an audit account has been created and configured as delegated administrator for SecurityHub CSPM.
+  * SecurityHub CSPM is configured with Cross-Region aggregation.
+
+The design is as it follows:
+
+![SecurityHub CSPM Reports Design](images/aws-securityhub-cspm-reports.drawio.png)
+*Figure 1: SecurityHub CSPM Reports Design*
+
+[Design Source - draw.io](https://github.com/alexbar-hub/aws-securityhub-cspm-report/blob/main/images/aws-securityhub-cspm-reports.drawio)
+
 
 ### Automated
 The following resources are created automatically:
