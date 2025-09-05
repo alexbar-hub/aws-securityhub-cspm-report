@@ -90,7 +90,7 @@ Deploy the template, making sure to provide (in addition to the other parameters
 
 ### Manual steps - Post-deployment
 * generate a signed CloudFront URL for the S3 objects as it follows:
-  * connect to the root-tmx-audit account via cli
+  * connect to the audit account via cli
 
 ```bash
 $ aws cloudfront sign \
